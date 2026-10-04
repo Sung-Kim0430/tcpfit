@@ -9,6 +9,8 @@
 #   tcpfit.sh detect                        输出机器画像
 #   tcpfit.sh probe  --peer HOST            探测可用带宽(虚拟网卡读不到标称值时用)
 #   tcpfit.sh tune   [选项]                 应用基础调优
+#                    选项: --role proxy|bulk|mixed  --bw <Mbps|auto>
+#                          --rtt <毫秒|auto>  --peer HOST  --no-initcwnd  --save 名字
 #   tcpfit.sh sweep  --peer HOST [选项]     实测限速器拐点 (-4/-6 指定协议族, 默认 -4)
 #                                           预计流量很大时先问一次, 无人值守加 --yes
 #   tcpfit.sh shape  --rate N | --off       应用/移除出向整形
@@ -23,6 +25,15 @@
 #   tcpfit.sh archive delete <序号>         删除（0000 不可删）
 #   tcpfit.sh uninstall [--keep-archives]   卸载：回滚 + 删配置 + 删自己
 #
+# RTT（推导缓冲区用）: 缓冲区 = 2×带宽×RTT, 所以要改缓冲区就得先有 RTT.
+#           一键调优会问"主要用户在哪儿", 四种答法:
+#             1-4        按地区选（中国大陆优化线 / 香港日本 / 美西 / 欧洲）
+#             毫秒数     知道自己 RTT 的直接填, 1-2000
+#             回车       不设置, 用默认 150ms —— 覆盖 ≤300ms 的往返路径
+#             a          自动探测三网延迟（电信/联通/移动 各测一次, 取最差的一网）
+#           命令行: tune --rtt <毫秒> 或 tune --rtt auto; 只对本次生效, 不写设置文件.
+#           填小了是硬天花板: 缓冲区卡住更远的用户, 怎么测都上不去还查不出原因.
+#
 # 运行计数: 启动时会向 tcpfit.spacevps.cc 发一次匿名计数请求（纯计数, 不含任何
 #           机器标识, 只带版本号）, 用于显示"今天多少次 / 累计多少次".
 #           关掉:  TCPFIT_NO_TELEMETRY=1   或   touch /var/lib/tcpfit/no-telemetry
@@ -32,7 +43,7 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.5.9"
+VERSION="0.5.10"
 STATE_DIR="/var/lib/tcpfit"
 SYSCTL_FILE="/etc/sysctl.d/99-tcpfit.conf"
 QDISC_SCRIPT="/usr/local/sbin/tcpfit-qdisc.sh"
@@ -625,7 +636,7 @@ clear_owned_initcwnd(){
   ip -4 route replace "${clean[@]}" 2>/dev/null
 }
 
-# 算 BDP 用的 RTT. 固定 150ms, 不再探测.  用 --rtt 可以覆盖.
+# 算 BDP 用的 RTT. 默认 150ms, 不探测 —— 一键调优会问用户, CLI 用 --rtt 覆盖.
 #
 # 为什么不测了 —— 旧做法是 ping 五个国内 DNS 取中位数, 三个问题让它没法用:
 #
@@ -651,6 +662,221 @@ clear_owned_initcwnd(){
 # 估低才是真危险: 估 40 时缓冲区会算得过小, 2G 口到美西只剩 941 Mbps(47%),
 #     而且是硬天花板, 用户怎么测都上不去还查不出原因.
 DEFAULT_RTT=150
+
+# RTT 预设表: 按键|毫秒|说明. 菜单显示和输入解析共用这一张表 ——
+# 分成两处写迟早会漂移(改了菜单忘了改校验), 那是"选了 2 却按 50 算"这类静默错误.
+# 取的是典型值不是区间上限: 缓冲区覆盖到 2×RTT, 所以 50 覆盖 ≤100ms,
+# 对三网直连(40-70ms)已经够; 150 覆盖 ≤300ms, 大陆全场景都在里面.
+RTT_PRESETS="1|50|中国大陆优化线 / 三网直连
+2|150|香港 / 日本 / 新加坡
+3|180|美西（洛杉矶 / 圣何塞）
+4|250|欧洲（法兰克福 / 伦敦）"
+
+# 缓冲区能全速覆盖到的往返路径: 缓冲 = 2×BDP = 2×带宽×RTT, 所以是 2×RTT.
+rtt_cover(){ printf '%s' $(( ${1:-0} * 2 )); }
+
+# 预设按键 -> 毫秒. 不是预设返回 1.
+rtt_preset_ms(){
+  local key ms desc
+  while IFS='|' read -r key ms desc; do
+    [ -n "$key" ] || continue
+    [ "$1" = "$key" ] && { printf '%s' "$ms"; return 0; }
+  done <<< "$RTT_PRESETS"
+  return 1
+}
+
+# 把用户输入解析成毫秒数: 空 = 默认 / 1-4 = 预设 / 1-2000 = 毫秒数.
+# "90"、"90ms"、"90 毫秒" 都收（用户会照着屏幕上的单位写）.
+# 合法输出毫秒数, 非法返回 1, 由调用方重问.
+#
+# 为什么不直接问"你的 RTT 是多少": 绝大多数用户答不上来这个数 ——
+# 旧版本自己 ping 国内 DNS 又被 anycast 污染（香港机器测出 2ms, 真值 140+）,
+# 于是缓冲区算得比出厂值还小, 还打印一份看着正常的推导过程.
+# 让用户按"主要用户在哪儿"选, 是这台机器上唯一可靠的来源.
+rtt_parse_answer(){
+  local v p
+  v=$(printf '%s' "$1" | tr -d '[:blank:]' | tr 'A-Z' 'a-z')
+  v=${v%ms}; v=${v%毫秒}
+  [ -n "$v" ] || { printf '%s' "$DEFAULT_RTT"; return 0; }
+  # 预设只认【单个】数字键: 多位数(10/85/150)一律当毫秒数.
+  # 否则用户填 2ms 会被静默改成 150 —— 小值正是最危险的方向, 不能猜.
+  case "$v" in
+    [0-9]) if p=$(rtt_preset_ms "$v"); then printf '%s' "$p"; return 0; fi ;;
+  esac
+  is_posint "$v" 1 2000 || return 1
+  printf '%s' "$v"
+}
+
+# ── 三网延迟自动探测（可选路径, 回车默认仍是 150ms）──────────────────────
+# 三网分开测、取【最差的一网】, 不是取中位数、也不是取平均:
+#   旧版本 ping 五个国内 DNS 取中位数, 其中腾讯/百度/CNNIC 是 anycast ——
+#   香港机器命中就近节点, 实测 2ms/1ms/1ms, 而真值 138-145ms. 中位数一取,
+#   BDP 小 70 倍, 缓冲区掉到 4MB 出厂值, 还打印一份看着完全正常的推导过程.
+#   缓冲区要覆盖【所有】用户, 估低是硬天花板, 估高只是多花点内存
+#   （还有 RAM/32 和 tcp_mem 兜底）, 所以取最差的一网.
+# 目标必须是【单播的省级 DNS】, 不能再碰 anycast 的公共 DNS.
+# 每个网给一个主目标 + 一个备用, 主目标不回包才试备用（少等一轮）.
+RTT_CT_TARGETS="${TCPFIT_RTT_CT:-202.96.128.86 202.96.128.166}"
+RTT_CU_TARGETS="${TCPFIT_RTT_CU:-221.5.88.88 210.21.196.6}"
+RTT_CM_TARGETS="${TCPFIT_RTT_CM:-211.136.192.6 211.136.112.200}"
+
+# 单个目标的平均 RTT(ms). ping 不支持 / 目标不回包时输出空.
+# 【不带 -4】: 目标是 v4 字面量, 而 GNU inetutils 版 ping 不认 -4,
+# 带上会让整个探测在这类机器上全军覆没（auto_pick_peer 踩过同一个坑）.
+rtt_ping_one(){
+  ping -c 3 -q -W 2 "$1" 2>/dev/null |
+    awk -F'/' '/rtt|round-trip/{printf "%.0f", $5; exit}'
+}
+
+# 一个网的值: 依次试目标, 第一个回包的就算.
+# 同城/同机房往返可能小于 1ms, awk 取整后是 0, 而缓冲区参数不接受 0 —— 夹到 1.
+rtt_ping_isp(){
+  local t v
+  for t in $1; do
+    v=$(rtt_ping_one "$t")
+    [ -n "$v" ] || continue
+    [ "$v" -lt 1 ] 2>/dev/null && v=1
+    printf '%s' "$v"; return 0
+  done
+  return 1
+}
+
+# 三网探测. 输出 "取用值|电信|联通|移动"（没测到的网为空）; 一个都没测到返回 1.
+# 三组【并行】跑: 串行最坏情况是"有 ping 但机房挡 ICMP" —— 6 个目标各等 3×2 秒,
+# 用户要在一个提问上干等半分钟; 并行最坏约 12 秒, 正常约 3 秒.
+detect_rtt_three(){
+  command -v ping >/dev/null 2>&1 || return 1
+  local d ct cu cm v rtt=""
+  d=$(mktemp -d 2>/dev/null) || return 1
+  rtt_ping_isp "$RTT_CT_TARGETS" > "$d/ct" 2>/dev/null &
+  rtt_ping_isp "$RTT_CU_TARGETS" > "$d/cu" 2>/dev/null &
+  rtt_ping_isp "$RTT_CM_TARGETS" > "$d/cm" 2>/dev/null &
+  wait
+  ct=$(cat "$d/ct" 2>/dev/null)
+  cu=$(cat "$d/cu" 2>/dev/null)
+  cm=$(cat "$d/cm" 2>/dev/null)
+  rm -rf "$d"
+  for v in "$ct" "$cu" "$cm"; do
+    [ -n "$v" ] || continue
+    { [ -z "$rtt" ] || [ "$v" -gt "$rtt" ]; } 2>/dev/null && rtt="$v"
+  done
+  [ -n "$rtt" ] || return 1
+  printf '%s|%s|%s|%s' "$rtt" "$ct" "$cu" "$cm"
+}
+
+# 打印三网报告（stderr）+ 输出取用值（stdout）.
+# 失败返回 1: 探测失败绝不能 die —— 用户选的是"我不确定", 不该因此整个调优失败.
+rtt_probe_three(){
+  local res rtt ct cu cm ct_s cu_s cm_s
+  # 老版本的自定义目标变量（NETTUNE_RTT_TARGETS）从 0.5.3 起就没人读了 ——
+  # 它配的那组目标里混着 anycast, 正是当初"香港机器测出 2ms"的根因.
+  # 还导着它的人得知道它已经失效, 以及现在该改哪三个变量.
+  if [ -n "${NETTUNE_RTT_TARGETS:-}" ]; then
+    warn "NETTUNE_RTT_TARGETS 已不再生效; 自定义探测目标请改用 TCPFIT_RTT_CT / TCPFIT_RTT_CU / TCPFIT_RTT_CM" >&2
+  fi
+  info "三网延迟探测中（电信 / 联通 / 移动, 各 3 个包）..." >&2
+  if ! res=$(detect_rtt_three); then
+    warn "三网都没测到延迟 —— 本机没有 ping / 机房挡 ICMP / 目标不可达" >&2
+    return 1
+  fi
+  rtt="${res%%|*}"; res="${res#*|}"
+  ct="${res%%|*}";  res="${res#*|}"
+  cu="${res%%|*}";  cm="${res##*|}"
+  ct_s=$([ -n "$ct" ] && printf '%s ms' "$ct" || printf '无响应')
+  cu_s=$([ -n "$cu" ] && printf '%s ms' "$cu" || printf '无响应')
+  cm_s=$([ -n "$cm" ] && printf '%s ms' "$cm" || printf '无响应')
+  printf '      电信 %s 联通 %s 移动 %s → 取 %s ms（三网里最差的一网）\n' \
+    "$(_pad "$ct_s" 9)" "$(_pad "$cu_s" 9)" "$(_pad "$cm_s" 9)" "$rtt" >&2
+  printf '%s' "$rtt"
+}
+
+# RTT 提问, 向导和菜单共用.
+# 毫秒数走 stdout, 说明走 stderr —— 调用方是 rtt=$(ask_rtt),
+# 打到 stdout 的说明会被一起吞进变量.
+ask_rtt(){
+  local d="${1:-$DEFAULT_RTT}" key ms desc ans cur
+  # 默认值必须自校验: 传入非法值 + 没有终端（ask 只会原样回默认值）= 死循环.
+  is_posint "$d" 1 2000 || d="$DEFAULT_RTT"
+  cur=$(conf_basis rtt)
+  {
+    echo
+    echo "    缓冲区大小 = 2 × 带宽 × RTT, 所以这个值决定能全速覆盖多远的用户."
+    echo "    填小了, 更远的用户单流会被缓冲区卡住 —— 那是查不出原因的硬天花板."
+    echo
+    while IFS='|' read -r key ms desc; do
+      [ -n "$key" ] || continue
+      printf '      %s) %s %4s ms   → 覆盖 ≤%s ms%s\n' \
+        "$key" "$(_pad "$desc" 25)" "$ms" "$(rtt_cover "$ms")" \
+        "$([ "$ms" = "$d" ] && echo '   ← 回车默认')"
+    done <<< "$RTT_PRESETS"
+    # 自动探测是可选路径, 不是默认 —— 它依赖 ping + ICMP, 有些机房就是不给.
+    if command -v ping >/dev/null 2>&1; then
+      echo "      a) 自动探测三网延迟（电信 / 联通 / 移动 各测一次, 取最差的一网）"
+    else
+      echo "      a) 自动探测三网延迟 —— 本机没有 ping, 用不了（可先装 iputils-ping）"
+    fi
+    # 已经调过的机器（包括旧版本调的）把当前生效的 RTT 摆出来, 免得升级后
+    # 想沿用却不知道原来填的是多少. 但【不】把它设成默认值: 估低才是危险方向,
+    # 上次可能填得很小, 一次回车就把机器悄悄带回"缓冲区卡住远端用户"的状态.
+    if [ -n "$cur" ] && [ "$cur" != "$d" ]; then
+      echo "    现在生效的这套配置是按 RTT ${cur} ms 推的（上次调优留下的记录）; 想沿用就填 ${cur}."
+    fi
+    echo
+    echo "    也可以直接填毫秒数（1-2000）, 例如 85; 回车 = ${d} ms（覆盖 ≤$(rtt_cover "$d") ms）."
+    have_tty || echo "    没有可交互的终端, 按 ${d} ms 继续."
+  } >&2
+  while true; do
+    ans=$(ask "  RTT 毫秒 / 1-4 选地区 / a 自动探测" "$d")
+    case "$(printf '%s' "$ans" | tr -d '[:blank:]' | tr 'A-Z' 'a-z')" in
+      a|auto|自动|自动探测)
+        # 探测失败不退出、也不用错值: 说清楚原因, 让用户改填或回车取默认
+        if ms=$(rtt_probe_three); then printf '%s' "$ms"; return 0; fi
+        warn "  自动探测失败, 回车用默认 ${d} ms, 也可以直接填一个数"
+        continue ;;
+    esac
+    if ms=$(rtt_parse_answer "$ans"); then printf '%s' "$ms"; return 0; fi
+    warn "  请输入 1-2000 的毫秒数, 1-4 选地区, 或 a 自动探测"
+  done
+}
+
+# 从 /etc/sysctl.d/99-tcpfit.conf 的头部注释读回"当时是按什么推导的".
+# tune 写进去的那一行是:
+#   # 带宽=500Mbps  RTT=150ms  内存=4096MB  角色=proxy
+# 缓冲区是 2×BDP 算出来的, 而 BDP 里有带宽和 RTT —— 光看 tcp_rmem 那几个数,
+# 看不出这套值是不是按"自己用户的距离"算的. 只有这条注释能回答.
+# 没调优过 / 文件被换掉时输出空, 由调用方决定怎么显示.
+conf_basis(){   # conf_basis bw|rtt|ver
+  [ -f "$SYSCTL_FILE" ] || return 1
+  case "$1" in
+    bw)  grep -oE '带宽=[0-9]+' "$SYSCTL_FILE" 2>/dev/null | head -1 | grep -oE '[0-9]+' ;;
+    rtt) grep -oE 'RTT=[0-9]+'  "$SYSCTL_FILE" 2>/dev/null | head -1 | grep -oE '[0-9]+' ;;
+    # 生成这份配置的 tcpfit 版本. 老机器上"这套缓冲区是谁写的"只能从这里看.
+    ver) grep -oE 'tcpfit v[0-9][0-9.]*' "$SYSCTL_FILE" 2>/dev/null | head -1 | sed 's/^tcpfit v//' ;;
+    *)   return 1 ;;
+  esac
+}
+
+# status 里 Assumed RTT 那一行的文案. 必须分三种情况 ——
+# "没调过"和"调过但配置里没记 RTT"是两回事: 后者（nettune 时代迁移过来、
+# 手工改过、或别的工具写的 99-tcpfit.conf）报"还没跑过 tune"是错的,
+# 用户会以为自己这台机器没被调过, 而实际上缓冲区早就按某个 RTT 改过了.
+rtt_basis_text(){
+  local rtt bw ver
+  rtt=$(conf_basis rtt)
+  if [ -n "$rtt" ]; then
+    bw=$(conf_basis bw)
+    printf '%s ms  → 缓冲区覆盖 ≤%s ms%s' "$rtt" "$(rtt_cover "$rtt")" \
+      "${bw:+（推导带宽 ${bw} Mbps）}"
+    return 0
+  fi
+  if [ -f "$SYSCTL_FILE" ]; then
+    ver=$(conf_basis ver)
+    printf '未记录（配置由 %s 写入, 没留 RTT 基准; 重跑一次 tune 就会记上）' \
+      "${ver:+v}${ver:-旧版本}"
+  else
+    printf 'unknown（还没跑过 tune, 缓冲区是出厂值）'
+  fi
+}
 
 detect_ram_mb(){ awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo; }
 detect_cores(){  nproc 2>/dev/null || echo 1; }
@@ -682,7 +908,7 @@ cmd_detect(){
   kv "Virt"        "$virt"
   kv "CPU cores"   "$cores"
   kv "Memory MB"   "$ram"
-  kv "RTT (assumed)" "${rtt}ms  — 固定值, 用于估算 TCP 缓冲区; 要改用 tune --rtt"
+  kv "RTT (assumed)" "${rtt}ms  — 缓冲区按 2×BDP 推导（覆盖 ≤$(rtt_cover "$rtt")ms 的路径）; 调优时会问你, 或 tune --rtt <毫秒|auto>"
   kv "CC available" "$cc_avail"
   kv "BBR"         "$(has_word "$cc_avail" bbr && echo 是 || (modprobe tcp_bbr 2>/dev/null && echo '是(需加载模块)' || echo 否))"
 
@@ -1681,7 +1907,7 @@ cmd_tune(){
       --peer) peer="$2"; shift 2 ;;
       --no-initcwnd) no_initcwnd=1; shift ;;
       --save) ARCH_SAVE_NAME="$2"; shift 2 ;;
-      *) die "未知参数: $1" ;;
+      *) die "未知参数: $1（tune 支持 --role/--bw/--rtt/--peer/--no-initcwnd/--save）" ;;
     esac
   done
   case "$role" in proxy|bulk|mixed) ;; *) die "role 只能是 proxy / bulk / mixed" ;; esac
@@ -1692,10 +1918,22 @@ cmd_tune(){
   set_route_target "$peer"
   local iface ram; iface=$(detect_iface); ram=$(detect_ram_mb)
   [ -n "$iface" ] || die "找不到默认路由网卡"
-  # --rtt 给了就用给的, 没给就用固定值. 不再探测, 所以不会再出现
-  # "无法确定 RTT" 这种把用户指向死路的报错（向导里根本没地方填 --rtt）.
+  # --rtt 给了就用给的, 没给就用固定值（一键调优会先问用户, 再把答案传进来）.
+  # 不探测, 所以不会再出现 "无法确定 RTT" 这种把用户指向死路的报错.
+  # 校验必须在这里 —— take_snapshot 在下面, 参数错就不能留下任何痕迹.
+  if [ "$rtt" = auto ]; then
+    # 与提问里的 a) 同一条路径. 探测失败回落到默认值, 不能让整个调优失败 ——
+    # 选 auto 的用户表达的是"我不确定", 不是"探测失败就别调了".
+    if rtt=$(rtt_probe_three); then
+      ok "Auto-detected RTT ${rtt} ms (worst of CT/CU/CM)"
+    else
+      warn "三网延迟都测不到, 回落到默认 ${DEFAULT_RTT} ms"
+      rtt="$DEFAULT_RTT"
+    fi
+  fi
   if [ -n "$rtt" ]; then
-    is_posint "$rtt" 1 2000 || die "--rtt 必须是 1-2000 之间的整数（毫秒）"
+    is_posint "$rtt" 1 2000 ||
+      die "--rtt 必须是 1-2000 之间的整数（毫秒）, 或 auto; 例: --rtt 180 / --rtt auto"
   else
     rtt="$DEFAULT_RTT"
   fi
@@ -1726,6 +1964,9 @@ cmd_tune(){
 
   info "Derived from: ${bw} Mbps / RTT ${rtt} ms / ${ram} MB RAM / role $role"
   kv "  BDP"            "$(awk -v v="$bdp" 'BEGIN{printf "%.1f MB", v/1048576}')"
+  # 缓冲区够不够, 不看绝对值看覆盖到多远: 缓冲 = 2×BDP, 所以 2×RTT 是分界线.
+  # 这条必须打出来 —— 用户填了一个偏小的 RTT 时, 屏幕上这是唯一的信号.
+  kv "  Coverage"       "≤ $(rtt_cover "$rtt") ms 的往返路径（缓冲 = 2×BDP）"
   kv "  Buffer max"     "$(awk -v v="$buf_max" 'BEGIN{printf "%.0f MB", v/1048576}')  ($(buf_max_reason "$bdp" "$ram" "$buf_max"))"
   kv "  Buffer default" "$(awk -v v="$buf_def" 'BEGIN{printf "%.0f MB", v/1048576}')  (role $role)"
   kv "  tcp_mem"        "$(echo "$tcp_mem" | awk '{printf "%.0fM / %.0fM / %.0fM", $1*4/1024, $2*4/1024, $3*4/1024}')  (RAM 1/16, 1/8, 1/4)"
@@ -3315,19 +3556,26 @@ cmd_sweep(){
 
 # ── 验证与状态 ──────────────────────────────────────────────────────────────
 cmd_status(){
-  local iface; iface=$(detect_iface)
+  local iface _cv; iface=$(detect_iface)
+  _cv=$(conf_basis ver)
   echo "── Current configuration ──"
   kv "Kernel"      "$(uname -r)"
   kv "Congestion"  "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
   kv "Default qdisc" "$(sysctl -n net.core.default_qdisc 2>/dev/null)"
   kv "Active qdisc" "$(tc qdisc show dev "$iface" 2>/dev/null | head -1 | awk '{print $2}')"
   kv "Egress shaper" "$(first_or "$(r=$(tc_rate_mbit "$(tc class show dev "$iface" 2>/dev/null)") && echo "${r} Mbit")" none)"
+  # 缓冲区是 2×BDP 算出来的, 而 BDP 里有 RTT —— 光看下面 tcp_rmem 那三个数,
+  # 看不出它是不是按"自己用户的距离"算的. 这里把调优时写进配置文件的推导基准读回来.
+  # 老机器的配置（nettune 时代迁移过来 / 手工改过）可能根本没有这条记录,
+  # rtt_basis_text 会把这种情况和"完全没调过"分开说.
+  kv "Assumed RTT" "$(rtt_basis_text)"
   kv "tcp_rmem"    "$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null | tr '\t' ' ')"
   kv "tcp_wmem"    "$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null | tr '\t' ' ')"
   kv "tcp_mem"     "$(sysctl -n net.ipv4.tcp_mem 2>/dev/null | awk '{printf "%.0fM/%.0fM/%.0fM", $1*4/1024,$2*4/1024,$3*4/1024}')"
   kv "Backlog"     "$(sysctl -n net.core.netdev_max_backlog 2>/dev/null)"
   kv "initcwnd"    "$(ip route show default | grep -oE 'initcwnd [0-9]+' || echo '默认(10)')"
-  kv "tcpfit conf" "$([ -f "$SYSCTL_FILE" ] && echo applied || echo absent)"
+  # 带上"谁写的": 老机器上升级/降级排查第一个要问的就是这个
+  kv "tcpfit conf" "$([ -f "$SYSCTL_FILE" ] && echo "applied${_cv:+（由 v${_cv} 生成）}" || echo absent)"
   kv "Shaper svc"  "$(systemctl is-enabled tcpfit-qdisc.service 2>/dev/null || echo 未安装)"
   kv "Snapshot"    "$([ -f "$SNAPSHOT" ] && echo "$SNAPSHOT" || echo 无)"
   echo
@@ -3798,12 +4046,14 @@ banner(){
 }
 
 # 一键全自动.
-# 设计原则：所有要用户回答的东西集中在最前面（3 个问题）, 确认之后一路跑到底不再打断；
+# 设计原则：所有要用户回答的东西集中在最前面（4 个问题: 带宽、RTT、对端、用途）,
+# 确认之后一路跑到底不再打断；
 # 唯一的例外是流量: 实测出来的流量远超用户同意的数时, 停下来再问一次（默认否）.
 # 执行阶段的日志用英文（都是参数名和数值, 中英混排反而看不清）, 结论用中文.
 wizard(){
   local WIZARD=1 ARCH_INCLUDE_SWEEP=0 WIZARD_FAILED=0
   local ARCH_ROLE="" ARCH_BW="" ARCH_RTT="" ARCH_PEER=""
+  local rtt="" WIZ_RTT=""
   local ram; ram=$(detect_ram_mb)
   echo
   echo "  ── 一键调优 ──"
@@ -3852,8 +4102,9 @@ wizard(){
 
   # iperf3 单独放在最前面确认 —— 两个原因:
   #   1) 装包是会改系统的操作, 不该在用户点头之前做
-  #   2) 选对端那一步要用 iperf3 做占线探测, 所以必须在三个问题之前就位
-  local HAVE_IPERF3=1 QN=3
+  #   2) 选对端那一步要用 iperf3 做占线探测, 所以必须在所有提问之前就位
+  # 问题数: 带宽 / RTT / 对端 / 用途. 没有 iperf3 就没有对端可问, 少一个.
+  local HAVE_IPERF3=1 QN=4
   if command -v iperf3 >/dev/null 2>&1; then
     echo "  iperf3 已经安装 $(iperf3 --version 2>/dev/null | awk 'NR==1{print $2}')"
   else
@@ -3881,7 +4132,7 @@ wizard(){
     else
       # 不中止 —— 基础调优(BBR/缓冲区/起步)完全不依赖 iperf3, 那也是收益最大的一部分.
       # 少掉的是: 实测带宽、扫拐点、验证吞吐.
-      HAVE_IPERF3=0; QN=2
+      HAVE_IPERF3=0; QN=3
       explain_pkg_failure
       warn "所以这次只能做基础调优:"
       warn "  不能实测带宽(要你手填)、不能扫限速器拐点、不能验证吞吐."
@@ -3960,13 +4211,23 @@ wizard(){
     esac
   done
 
-  # ── 2/3 对端 ────────────────────────────────────────────────────────────
+  # ── 2/N RTT ─────────────────────────────────────────────────────────────
+  # RTT 是缓冲区推导的第二个输入（缓冲 = 2×带宽×RTT）, 所以和带宽挨着问.
+  # 以前脚本自己 ping 五个国内 DNS 取中位数, 被 anycast 污染得离谱
+  # （香港机器测出 2ms, 真值 140+）, BDP 算小之后缓冲区落到出厂值,
+  # 用户怎么测都上不去还查不出原因. 现在让用户按"主要用户在哪儿"选.
+  step "2/${QN}  到用户的 RTT"
+  rtt=$(ask_rtt)
+  WIZ_RTT="$rtt"
+  ok "按 RTT ${rtt}ms 推导缓冲区（覆盖 ≤$(rtt_cover "$rtt")ms 的路径）"
+
+  # ── 3/N 对端 ────────────────────────────────────────────────────────────
   # 没有 iperf3 就没有对端可言, 整段跳过, 且强制不做整形
   local peer="(不需要)"
   if [ "$HAVE_IPERF3" = 0 ]; then
     MANUAL_RATE="${MANUAL_RATE:-off}"
   else
-  step "2/${QN}  确认测速对端"
+  step "3/${QN}  确认测速对端"
   echo
   echo "    拐点扫描需要一台对端机器跑 iperf3 服务端."
   echo
@@ -4012,7 +4273,7 @@ wizard(){
       warn "端口必须是 1-65535 之间的整数（IPv6 地址请写成 [地址]:端口）"; echo; continue
     fi
     # 手填的对端当场验一次可达性. 打错 IP 的话不该等到执行阶段才发现 ——
-    # 那时前面三个问题都白填了, 而且已经改过 sysctl.
+    # 那时前面几问都白填了, 而且已经改过 sysctl.
     printf '    检查 %s:%s … ' "$peer" "$PEER_PORT" >&2
     if probe_port "$peer" "$PEER_PORT" 6; then
       printf '%s\n' "$(_c '0;32' '可达')" >&2
@@ -4026,7 +4287,7 @@ wizard(){
   done
   fi
 
-  # ── 3/3 用途 ────────────────────────────────────────────────────────────
+  # ── N/N 用途 ────────────────────────────────────────────────────────────
   step "${QN}/${QN}  机器用途"
   echo
   echo "    1) 代理 / 加速        并发连接多, 缓冲区取保守值（最常见）"
@@ -4048,6 +4309,9 @@ wizard(){
   else
     _conf "带宽" "${bw} Mbps        整形安全余量 $(calc_margin "$bw") Mbit"
   fi
+  # 缓冲区是按这个 RTT 推的, 所以必须出现在确认页上 ——
+  # 用户填错了要在这里就能看出来, 而不是等结果页给一堆看不懂的 MB.
+  _conf "RTT (估)" "${rtt} ms        缓冲区覆盖 ≤$(rtt_cover "$rtt") ms 的路径"
   case "$MANUAL_RATE" in
     "")  _conf "整形" "实测拐点后自动决定" ;;
     off) _conf "整形" "不做整形" ;;
@@ -4111,9 +4375,9 @@ wizard(){
   # 向导对 <=100M 保留内核默认值. 显式 tune 命令的旧行为不变.
   if [ "$bw" -le 100 ] 2>/dev/null; then
     info "Low-bandwidth path: keeping the kernel default initcwnd"
-    cmd_tune --role "$role" --bw "$bw" --no-initcwnd || die "base tuning failed"
+    cmd_tune --role "$role" --bw "$bw" --rtt "$rtt" --no-initcwnd || die "base tuning failed"
   else
-    cmd_tune --role "$role" --bw "$bw" || die "base tuning failed"
+    cmd_tune --role "$role" --bw "$bw" --rtt "$rtt" || die "base tuning failed"
   fi
   ARCH_PEER="$peer"
 
@@ -4292,6 +4556,10 @@ wizard_result(){   # wizard_result <带宽> <整形值> <拐点> <余量> <内�
   local cur_shape=""
   printf '\n  %s════ 结果 ══════════════════════════════════════════════%s\n' "$bold" "$plain"
   echo
+  # 缓冲区是这套值的根: 结果页只给整形和验证数字的话, 用户看不出"按谁的延迟算的".
+  # WIZ_RTT 只有向导那一条路径会设, 别处调本函数时留空, 不打印.
+  [ -n "${WIZ_RTT:-}" ] &&
+    _conf "RTT (估)" "${WIZ_RTT} ms        缓冲区覆盖 ≤$(rtt_cover "$WIZ_RTT") ms 的路径"
   if [ -n "$knee" ]; then
     _conf "实测端口上限" "${knee} Mbit"
     _conf "安全余量"     "${margin} Mbit（按 ${bw}M 档位）"
@@ -4414,9 +4682,17 @@ menu_loop(){
       2) local r; r=$(ask "  用途 1) 代理/加速  2) 大文件传输" "1")
          local role=proxy; [ "$r" = 2 ] && role=bulk
          local b; b=$(ask "  带宽 Mbps (回车=自动探测)" "")
-         if [ -n "$b" ]; then cmd_tune --role "$role" --bw "$b"
+         # RTT 要问, 而且只在这条路径确定会调优时才问 ——
+         # 放在带宽之前的话, 带宽和自动对端都拿不到时那一问就白问了.
+         local mrtt=""
+         if [ -n "$b" ]; then
+           mrtt=$(ask_rtt)
+           cmd_tune --role "$role" --bw "$b" --rtt "$mrtt"
          else
-           local p; if p=$(auto_pick_peer); then PEER_PORT="${p##*:}"; cmd_tune --role "$role" --bw auto --peer "${p%:*}"
+           local p; if p=$(auto_pick_peer); then
+             PEER_PORT="${p##*:}"
+             mrtt=$(ask_rtt)
+             cmd_tune --role "$role" --bw auto --peer "${p%:*}" --rtt "$mrtt"
            else warn "No peer available; specify bandwidth manually"; fi
          fi ;;
       3) local p; if p=$(auto_pick_peer); then

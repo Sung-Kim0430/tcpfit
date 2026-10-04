@@ -41,7 +41,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Kylin010/tcpfit/main/tcpfit.
 脚本不会自动更新. 装好之后跑的一直是装的那一版, 想升级用菜单 8 或 `tcpfit update` ——
 它只检查, 发现新版本会问你要不要更新.
 
-一键调优只问三个问题: 带宽、测速对端、机器用途. 确认之后跑到底不再打断.
+一键调优只问四个问题: 带宽、RTT、测速对端、机器用途. 确认之后跑到底不再打断.
 
 带宽那一问支持四种输入:
 
@@ -52,12 +52,51 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Kylin010/tcpfit/main/tcpfit.
 | `m` | 直接填限速值, 跳过拐点扫描 |
 | `0` | 不做整形 |
 
+## RTT 怎么定
+
+RTT 只用来推缓冲区: **缓冲区 = 2 × 带宽 × RTT**, 所以要改缓冲区就得先有这个数.
+脚本不自己猜, 而是问"你的主要用户在哪儿", 四种答法都可以:
+
+| 输入 | RTT | 缓冲区覆盖到 |
+|---|---|---|
+| `1` 中国大陆优化线 / 三网直连 | 50ms | ≤100ms |
+| `2` 香港 / 日本 / 新加坡 | 150ms | ≤300ms |
+| `3` 美西（洛杉矶 / 圣何塞） | 180ms | ≤360ms |
+| `4` 欧洲（法兰克福 / 伦敦） | 250ms | ≤500ms |
+| 毫秒数（1-2000，如 `85`） | 按填的算 | 2 × 该值 |
+| 回车（不设置） | 默认 150ms | ≤300ms |
+| `a` 自动探测三网延迟 | 三网实测里最差的一网 | 2 × 该值 |
+
+**`a` 自动探测**分别 ping 电信 / 联通 / 移动的单播省级 DNS, 三网分开报数:
+
+```
+[*] 三网延迟探测中（电信 / 联通 / 移动, 各 3 个包）...
+      电信 138 ms 联通 93 ms  移动 55 ms  → 取 138 ms（三网里最差的一网）
+```
+
+取**最差的一网**而不是平均/中位数: 缓冲区要覆盖所有用户, 估低是硬天花板, 估高只是多花内存
+（还有 `RAM/32` 和 `tcp_mem` 兜底). 目标也刻意避开 anycast 的公共 DNS —— 旧版本 ping
+`119.29.29.29` 这类 anycast 地址取中位数, 香港机器实测只有 2ms（真值 140ms+),
+缓冲区直接掉到 4MB 出厂值. 目标可用 `TCPFIT_RTT_CT` / `TCPFIT_RTT_CU` / `TCPFIT_RTT_CM`
+覆盖. 没装 ping 或机房挡 ICMP 时探测会失败, 这时回车用默认值即可, 不会中止调优.
+
+"覆盖到"是 **2 × RTT**: 缓冲区是 2×BDP, 所以估 E 能全速覆盖到 2E 的往返路径.
+填小了是**硬天花板** —— 更远的用户单流会被缓冲区卡住, 怎么测都上不去还查不出原因
+（实测估 40ms 时 2G 口到美西只剩 941 Mbps). 反过来填大了收益递减: 小内存机早被
+`RAM/32` 封顶接住, 大机器上要多付 BBR 超发的账.
+
+命令行用 `tune --rtt <毫秒>`（1-2000）或 `tune --rtt auto`（等于上面的 `a`）直接指定,
+只对本次生效, 不写任何设置文件.
+`status` 会把**当前这套缓冲区是按什么 RTT 推出来的**从配置文件头注释里读回来显示.
+
 ## 子命令
 
 ```bash
 tcpfit detect                                     # 机器画像
 tcpfit probe    --peer <近处iperf3服务器>          # 探测可用带宽
 tcpfit tune     --role proxy --bw 500             # 基础调优
+tcpfit tune     --role proxy --bw 500 --rtt 180   # 指定 RTT（缓冲区覆盖 ≤360ms）
+tcpfit tune     --role proxy --bw 500 --rtt auto  # 自动探测三网延迟后取最差的一网
 tcpfit tune     --role proxy --bw 500 --save 换机房前   # 调优并给存档命名
 tcpfit sweep    --peer <近处iperf3服务器> --nominal 500   # 扫拐点, 加 --yes 跳过流量确认
 tcpfit shape    --rate 510                        # 应用整形
@@ -122,7 +161,8 @@ python3 orchestrator/fleet.py verify
 | 起步 | `tcp_slow_start_after_idle=0` / `initcwnd 32` |
 | 出向整形 | HTB 全局上限 + fq 叶子 pacing |
 
-基础调优设 30 个 sysctl 参数, 加 swap 时再设 `vm.swappiness`. 缓冲区和整形值按每台机器实测推导, 不是固定值.
+基础调优设 30 个 sysctl 参数, 加 swap 时再设 `vm.swappiness`. 缓冲区和整形值按每台机器实测推导, 不是固定值 ——
+缓冲区上限 = `2 × 带宽 × RTT + 2MiB`（RTT 见上节）, 再受 `tcp_mem` 和内存 1/32 两道约束.
 
 ## 拐点扫描怎么工作
 
@@ -205,9 +245,21 @@ systemd 255 以下的机器, 网络服务重启后要等网卡重连或开机才
 - 需要 Linux + systemd + iproute2. OpenVZ/LXC 上 `tc` 和 `initcwnd` 可能受限
 - `sweep` 需要一台近处的 iperf3 对端
 
-## 从 nettune 升级
+## 从旧版本升级
 
 老机器上的产物文件名还是 `nettune-*`, 新版本会自动检测并搬迁, 快照和 rollback 都保留. 直接跑新版即可.
+
+RTT 这块对旧版本是**只读**的, 不会动任何已有状态:
+
+- 存档格式没变（`PARAM_RTT` 只写不读), 旧版本建的存档照常 list / restore / rollback
+- 没有新增任何状态文件 —— 降级回旧版本不会留下它看不懂的东西
+- 旧版本写的 `99-tcpfit.conf` 头注释格式从最早一版起就没变过, `status` 能直接读回
+  当时用的带宽 / RTT; 读不到时（nettune 时代迁移过来的、手工改过的）会明说是
+  "配置由 XX 写入, 没留 RTT 基准", 不会谎报成"还没跑过 tune"
+- `status` 的 `tcpfit conf` 会标出这份配置是哪个版本生成的, 升级/降级排查先看这一行
+- 已经调过的机器重跑一键调优时, RTT 那一问会把**当前生效的 RTT** 显示出来
+  （"现在生效的这套配置是按 RTT 180 ms 推的…想沿用就填 180"）;
+  但回车默认值仍是 150ms —— 上次可能填得很小, 不该让一次回车把机器带回那个风险上
 
 ## 许可证
 
